@@ -990,13 +990,13 @@ transaction_ready (FlatpakTransaction  *transaction,
       GPtrArray *op_related_to_ops = flatpak_transaction_operation_get_related_to_ops (op);  /* (element-type FlatpakTransactionOperation) */
       FlatpakTransactionOperationType type = flatpak_transaction_operation_get_operation_type (op);
 
-      /* There is currently no way for a set of updates to lead to an
-       * uninstall, but check anyway.
+      /* There may be an uninstall op if a runtime will now be considered
+       * unused after the updates
        */
       if (type == FLATPAK_TRANSACTION_OPERATION_UNINSTALL)
         {
           const char *ref = flatpak_transaction_operation_get_ref (op);
-          g_warning ("Update transaction unexpectedly wants to uninstall %s", ref);
+          g_debug ("Update transaction wants to uninstall %s", ref);
           continue;
         }
 
@@ -2737,7 +2737,7 @@ flatpak_installation_list_installed_related_refs_sync (FlatpakInstallation *self
   if (dir == NULL)
     return NULL;
 
-  related = flatpak_dir_find_local_related (dir, ref, NULL, remote_name, TRUE,
+  related = flatpak_dir_find_local_related (dir, ref, remote_name, TRUE,
                                             cancellable, error);
   if (related == NULL)
     return NULL;
@@ -2882,12 +2882,47 @@ flatpak_installation_run_triggers (FlatpakInstallation *self,
   return flatpak_dir_run_triggers (dir, cancellable, error);
 }
 
+static gboolean
+maybe_get_metakey_and_origin (FlatpakDir  *dir,
+                              const char  *ref,
+                              GHashTable  *metadata_injection,
+                              GKeyFile   **out_metakey,
+                              char       **out_origin)
+{
+  g_autoptr(GKeyFile) metakey = NULL;
+  g_autofree char *origin = NULL;
+
+  origin = flatpak_dir_get_origin (dir, ref, NULL, NULL);
+  if (origin == NULL)
+    return FALSE;
+
+  if (metadata_injection != NULL)
+    metakey = g_hash_table_lookup (metadata_injection, ref);
+  if (metakey != NULL)
+    g_object_ref (metakey);
+  else
+    {
+      g_autoptr(FlatpakDeploy) deploy = flatpak_dir_load_deployed (dir, ref, NULL, NULL, NULL);
+      if (deploy == NULL)
+        return FALSE;
+      metakey = flatpak_deploy_get_metadata (deploy);
+    }
+
+  if (out_metakey)
+    *out_metakey = g_steal_pointer (&metakey);
+  if (out_origin)
+    *out_origin = g_steal_pointer (&origin);
+
+  return TRUE;
+}
 
 static void
 find_used_related_refs (FlatpakDir *dir,
                         FlatpakDir *system_dir, /* nullable */
                         GHashTable *used_refs,
+                        GHashTable *metadata_injection,
                         const char *ref,
+                        GKeyFile   *metakey,
                         const char *origin)
 {
   g_autoptr(GPtrArray) related = NULL;
@@ -2899,9 +2934,9 @@ find_used_related_refs (FlatpakDir *dir,
   /* If @system_dir is non-NULL, that means @ref exists in @dir but we should
    * look in @system_dir for related things */
   if (system_dir != NULL)
-    related = flatpak_dir_find_local_related (system_dir, ref, dir, origin, TRUE, NULL, NULL);
+    related = flatpak_dir_find_local_related_for_metadata (system_dir, ref, origin, metakey, NULL, NULL);
   else
-    related = flatpak_dir_find_local_related (dir, ref, NULL, origin, TRUE, NULL, NULL);
+    related = flatpak_dir_find_local_related_for_metadata (dir, ref, origin, metakey, NULL, NULL);
 
   if (related == NULL)
     return;
@@ -2922,12 +2957,17 @@ find_used_related_refs (FlatpakDir *dir,
       if (!rel->auto_prune && !g_hash_table_contains (used_refs, rel->ref))
         {
           g_autofree char *related_origin = NULL;
+          g_autoptr(GKeyFile) related_metakey = NULL;
 
           g_hash_table_add (used_refs, g_strdup (rel->ref));
 
-          related_origin = flatpak_dir_get_origin (system_dir ? system_dir : dir, rel->ref, NULL, NULL);
-          if (related_origin != NULL)
-            find_used_related_refs (system_dir ? system_dir : dir, NULL, used_refs, rel->ref, related_origin);
+          if (system_dir != NULL &&
+              maybe_get_metakey_and_origin (system_dir, rel->ref, NULL, &related_metakey, &related_origin))
+            find_used_related_refs (system_dir, NULL, used_refs, NULL,
+                                    rel->ref, related_metakey, related_origin);
+          else if (maybe_get_metakey_and_origin (dir, rel->ref, metadata_injection, &related_metakey, &related_origin))
+            find_used_related_refs (dir, NULL, used_refs, metadata_injection,
+                                    rel->ref, related_metakey, related_origin);
         }
     }
 }
@@ -2937,6 +2977,7 @@ find_used_refs_for_apps (FlatpakDir  *dir,
                          FlatpakDir  *system_dir, /* nullable */
                          char       **app_refs,
                          const char  *arch,
+                         GHashTable  *metadata_injection,
                          GHashTable  *used_runtimes,
                          GHashTable  *used_refs)
 {
@@ -2949,7 +2990,6 @@ find_used_refs_for_apps (FlatpakDir  *dir,
   for (i = 0; app_refs[i] != NULL; i++)
     {
       const char *ref = app_refs[i];
-      g_autoptr(FlatpakDeploy) deploy = NULL;
       g_autofree char *origin = NULL;
       g_autofree char *runtime = NULL;
       g_autofree char *sdk = NULL;
@@ -2959,17 +2999,11 @@ find_used_refs_for_apps (FlatpakDir  *dir,
       if (arch != NULL && strcmp (parts[2], arch) != 0)
         continue;
 
-      deploy = flatpak_dir_load_deployed (dir, ref, NULL, NULL, NULL);
-      if (deploy == NULL)
+      if (!maybe_get_metakey_and_origin (dir, ref, metadata_injection, &metakey, &origin))
         continue;
 
-      origin = flatpak_dir_get_origin (dir, ref, NULL, NULL);
-      if (origin == NULL)
-        continue;
+      find_used_related_refs (dir, system_dir, used_refs, metadata_injection, ref, metakey, origin);
 
-      find_used_related_refs (dir, system_dir, used_refs, ref, origin);
-
-      metakey = flatpak_deploy_get_metadata (deploy);
       runtime = g_key_file_get_string (metakey, "Application", "runtime", NULL);
       if (runtime)
         {
@@ -3007,6 +3041,7 @@ find_used_refs_for_apps (FlatpakDir  *dir,
 static void
 find_used_refs_for_runtimes (FlatpakDir *dir,
                              FlatpakDir *system_dir,
+                             GHashTable *metadata_injection,
                              GHashTable *runtimes,
                              GHashTable *used_refs)
 {
@@ -3016,35 +3051,37 @@ find_used_refs_for_runtimes (FlatpakDir *dir,
   GLNX_HASH_TABLE_FOREACH (runtimes, const char *, runtime)
     {
       g_autofree char *runtime_ref = g_strconcat ("runtime/", runtime, NULL);
-      g_autoptr(FlatpakDeploy) deploy = NULL;
       g_autofree char *origin = NULL;
       g_autofree char *sdk = NULL;
       g_autoptr(GKeyFile) metakey = NULL;
 
-      deploy = flatpak_dir_load_deployed (dir, runtime_ref, NULL, NULL, NULL);
-      if (deploy == NULL)
+      if (!maybe_get_metakey_and_origin (dir, runtime_ref, metadata_injection,
+                                         &metakey, &origin))
         continue;
 
-      origin = flatpak_dir_get_origin (dir, runtime_ref, NULL, NULL);
-      if (origin == NULL)
-        continue;
+      find_used_related_refs (dir, system_dir, used_refs, metadata_injection,
+                              runtime_ref, metakey, origin);
 
-      find_used_related_refs (dir, system_dir, used_refs, runtime_ref, origin);
-
-      metakey = flatpak_deploy_get_metadata (deploy);
       sdk = g_key_file_get_string (metakey, "Runtime", "sdk", NULL);
       if (sdk)
         {
           g_autofree char *sdk_ref = g_strconcat ("runtime/", sdk, NULL);
-          g_autofree char *sdk_origin = flatpak_dir_get_origin (dir, sdk_ref, NULL, NULL);
-          if (sdk_origin)
-            find_used_related_refs (dir, system_dir, used_refs, sdk_ref, sdk_origin);
+          g_autofree char *sdk_origin = NULL;
+          g_autoptr(GKeyFile) sdk_metakey = NULL;
+
+          if (maybe_get_metakey_and_origin (dir, sdk_ref, metadata_injection,
+                                            &sdk_metakey, &sdk_origin))
+            find_used_related_refs (dir, system_dir, used_refs, metadata_injection,
+                                    sdk_ref, sdk_metakey, sdk_origin);
 
           if (system_dir != NULL && sdk_origin == NULL)
             {
-              g_autofree char *system_sdk_origin = flatpak_dir_get_origin (system_dir, sdk_ref, NULL, NULL);
-              if (system_sdk_origin)
-                find_used_related_refs (system_dir, NULL, used_refs, sdk_ref, sdk_origin);
+              g_autofree char *system_sdk_origin = NULL;;
+              g_autoptr(GKeyFile) system_sdk_metakey = NULL;
+              if (maybe_get_metakey_and_origin (system_dir, sdk_ref, NULL,
+                                                &system_sdk_metakey, &system_sdk_origin))
+                find_used_related_refs (system_dir, NULL, used_refs, NULL,
+                                        sdk_ref, system_sdk_metakey, system_sdk_origin);
             }
         }
     }
@@ -3075,6 +3112,62 @@ flatpak_installation_list_unused_refs (FlatpakInstallation *self,
                                        GCancellable        *cancellable,
                                        GError             **error)
 {
+  return flatpak_installation_list_unused_refs_with_options (self, arch, NULL, NULL, cancellable, error);
+}
+
+static void
+prune_excluded_refs (char **full_refs,
+                     char **refs_to_exclude)
+{
+  guint len = g_strv_length (full_refs);
+  for (guint i = 0; i < len; i++)
+    {
+      if (g_strv_contains ((const gchar * const*)refs_to_exclude, full_refs[i]))
+        {
+          g_free (full_refs[i]);
+          full_refs[i] = full_refs[len - 1];
+          full_refs[len - 1] = NULL;
+          len--;
+          i--;
+        }
+    }
+}
+
+/**
+ * flatpak_installation_list_unused_refs_with_options:
+ * @self: a #FlatpakInstallation
+ * @arch: (nullable): if non-%NULL, the architecture of refs to collect
+ * @metadata_injection: (nullable): if non-%NULL, a #GHashTable mapping refs to
+ *                                  #GKeyFile objects, which when available will
+ *                                  be used instead of installed metadata
+ * @options: (nullable): if non-%NULL, a GVariant a{sv} with an extensible set
+ *                       of options
+ * @cancellable: (nullable): a #GCancellable
+ * @error: return location for a #GError
+ *
+ * Like flatpak_installation_list_unused_refs() but supports an extensible set
+ * of options as well as an @metadata_injection parameter. The following are
+ * currently defined:
+ *
+ *   * exclude-refs (as): Act as if these refs are not installed even if they
+ *       are when determining the set of unused refs
+ *   * filter-by-eol (b): Only return refs as unused if they are End-Of-Life.
+ *       Note that if this option is combined with other filters (of which there
+ *       are none currently) non-EOL refs may also be returned.
+ *
+ * Returns: (transfer container) (element-type FlatpakInstalledRef): a GPtrArray of
+ *   #FlatpakInstalledRef instances
+ *
+ * Since: 1.9.1
+ */
+GPtrArray *
+flatpak_installation_list_unused_refs_with_options (FlatpakInstallation *self,
+                                                    const char          *arch,
+                                                    GHashTable          *metadata_injection,
+                                                    GVariant            *options,
+                                                    GCancellable        *cancellable,
+                                                    GError             **error)
+{
   g_autoptr(FlatpakDir) dir = NULL;
   g_autoptr(GHashTable) refs_hash = NULL;
   g_autoptr(GPtrArray) refs =  NULL;
@@ -3082,7 +3175,15 @@ flatpak_installation_list_unused_refs (FlatpakInstallation *self,
   g_auto(GStrv) runtime_refs = NULL;
   g_autoptr(GHashTable) used_refs = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   g_autoptr(GHashTable) used_runtimes = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  g_autofree char **refs_to_exclude = NULL;
+  gboolean filter_by_eol = FALSE;
   int i;
+
+  if (options)
+    {
+      (void) g_variant_lookup (options, "exclude-refs", "^a&s", &refs_to_exclude);
+      (void) g_variant_lookup (options, "filter-by-eol", "b", &filter_by_eol);
+    }
 
   dir = flatpak_installation_get_dir (self, error);
   if (dir == NULL)
@@ -3094,11 +3195,17 @@ flatpak_installation_list_unused_refs (FlatpakInstallation *self,
   if (!flatpak_dir_list_refs (dir, "runtime", &runtime_refs, cancellable, error))
     return NULL;
 
+  if (refs_to_exclude != NULL)
+    {
+      prune_excluded_refs (app_refs, refs_to_exclude);
+      prune_excluded_refs (runtime_refs, refs_to_exclude);
+    }
+
   refs_hash = g_hash_table_new (g_str_hash, g_str_equal);
   refs = g_ptr_array_new_with_free_func (g_object_unref);
 
   /* For each app, note the runtime, sdk, and related refs */
-  find_used_refs_for_apps (dir, NULL, app_refs, arch, used_runtimes, used_refs);
+  find_used_refs_for_apps (dir, NULL, app_refs, arch, metadata_injection, used_runtimes, used_refs);
 
   /* If @self is a system installation, also check the per-user installation
    * for any apps there using runtimes in the system installation or runtimes
@@ -3120,7 +3227,8 @@ flatpak_installation_list_unused_refs (FlatpakInstallation *self,
           if (!flatpak_dir_list_refs (user_dir, "app", &user_app_refs, cancellable, error))
             return NULL;
 
-          find_used_refs_for_apps (user_dir, dir, user_app_refs, arch, used_runtimes, used_refs);
+          /* metadata_injection is NULL because it's not for this installation */
+          find_used_refs_for_apps (user_dir, dir, user_app_refs, arch, NULL, used_runtimes, used_refs);
 
           if (!flatpak_dir_list_refs (user_dir, "runtime", &user_runtime_refs, cancellable, error))
             return NULL;
@@ -3132,11 +3240,11 @@ flatpak_installation_list_unused_refs (FlatpakInstallation *self,
               g_hash_table_add (user_runtimes, (char *)ref + strlen ("runtime/"));
             }
 
-          find_used_refs_for_runtimes (user_dir, dir, user_runtimes, used_refs);
+          find_used_refs_for_runtimes (user_dir, dir, NULL, user_runtimes, used_refs);
         }
     }
 
-  find_used_refs_for_runtimes (dir, NULL, used_runtimes, used_refs);
+  find_used_refs_for_runtimes (dir, NULL, metadata_injection, used_runtimes, used_refs);
 
   for (i = 0; runtime_refs[i] != NULL; i++)
     {
@@ -3152,10 +3260,27 @@ flatpak_installation_list_unused_refs (FlatpakInstallation *self,
           continue;
         }
 
-      if (!g_hash_table_contains (used_refs, ref))
+      if (!g_hash_table_contains (used_refs, ref) &&
+          g_hash_table_add (refs_hash, (gpointer) ref))
         {
-          if (g_hash_table_add (refs_hash, (gpointer) ref))
+          if (!filter_by_eol)
             g_ptr_array_add (refs, get_ref (dir, ref, NULL, NULL));
+          else
+            {
+              g_autoptr(GBytes) deploy_data = NULL;
+              deploy_data = flatpak_dir_get_deploy_data (dir, ref, FLATPAK_DEPLOY_VERSION_ANY,
+                                                         cancellable, error);
+              if (deploy_data == NULL)
+                return NULL;
+              if (flatpak_deploy_data_get_eol (deploy_data) == NULL &&
+                  flatpak_deploy_data_get_eol_rebase (deploy_data) == NULL)
+                {
+                  g_debug ("Ref %s is not EOL, considering as used", ref);
+                  continue;
+                }
+              else
+                g_ptr_array_add (refs, get_ref (dir, ref, NULL, NULL));
+            }
         }
     }
 
