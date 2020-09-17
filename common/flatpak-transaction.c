@@ -4162,7 +4162,7 @@ installed_ref_ref_equal (gconstpointer a,
 {
   FlatpakInstalledRef *iref = (FlatpakInstalledRef *)a;
   const char *needle_ref = (const char *)b;
-  g_autofree char *full_ref = flatpak_ref_format_ref (FLATPAK_REF (iref));
+  const char *full_ref = flatpak_ref_format_ref_cached (FLATPAK_REF (iref));
   return g_strcmp0 (full_ref, needle_ref) == 0;
 }
 
