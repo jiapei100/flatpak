@@ -1926,7 +1926,7 @@ op_get_related (FlatpakTransaction           *self,
     }
 
   if (transaction_is_local_only (self, op->kind))
-    related = flatpak_dir_find_local_related_for_metadata (priv->dir, op->ref, op->resolved_commit, op->remote, op->resolved_metakey,
+    related = flatpak_dir_find_local_related_for_metadata (priv->dir, op->ref, op->remote, op->resolved_metakey,
                                                            NULL, &related_error);
   else
     related = flatpak_dir_find_remote_related_for_metadata (priv->dir, state, op->ref, op->resolved_metakey,
@@ -4194,7 +4194,7 @@ find_related_from_deploy (FlatpakTransaction  *self,
     }
 
   related = flatpak_dir_find_local_related_for_metadata (priv->dir, ref,
-                                                         checksum, remote, metakey,
+                                                         remote, metakey,
                                                          NULL, &related_error);
   if (related_error != NULL)
     g_message (_("Warning: Problem looking for related refs: %s"), related_error->message);
